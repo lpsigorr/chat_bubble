@@ -2,18 +2,21 @@
 // SUPABASE CONFIGURATION
 // ============================================
 // Replace these with your Supabase project credentials
-const SUPABASE_URL = 'YOUR_SUPABASE_URL';
-const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
+const SUPABASE_URL = 'https://hnokcqofwvntkvvjxosu.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhub2tjcW9md3ZudGt2dmp4b3N1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkzNTkwOTMsImV4cCI6MjA5NDkzNTA5M30.iTgyQ2gI_4-28NJRe5nYPHYlwL5JE2fexIajgXK0EqI';
 
 // Initialize Supabase client
-const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-
+const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+ 
 // ============================================
 // STATE
 // ============================================
 let currentUser = null;
 let messageSubscription = null;
-
+let lastMessageId = 0;
+let pollingInterval = null;
+let usePolling = false; // Set to true if realtime fails
+ 
 // ============================================
 // DOM ELEMENTS
 // ============================================
@@ -29,7 +32,7 @@ const messageInput = document.getElementById('messageInput');
 const sendBtn = document.getElementById('sendBtn');
 const charCount = document.getElementById('charCount');
 const onlineCount = document.getElementById('onlineCount');
-
+ 
 // ============================================
 // AUTHENTICATION
 // ============================================
@@ -40,67 +43,86 @@ async function joinChat() {
         alert('Username too long (max 20 characters)');
         return;
     }
-
+ 
     currentUser = username;
     currentUsername.textContent = username;
-
+ 
     // Switch screens
     loginScreen.classList.remove('active');
     chatScreen.classList.add('active');
-
+ 
     // Load messages and subscribe
     await loadMessages();
-    subscribeToMessages();
-
+    
+    // Try realtime first, fall back to polling
+    try {
+        subscribeToMessages();
+    } catch (error) {
+        console.log('Realtime not available, using polling');
+        usePolling = true;
+        startPolling();
+    }
+ 
     // Send join notification
     await sendSystemMessage(`${username} joined the chat`);
-
+ 
     // Focus message input
     messageInput.focus();
 }
-
+ 
 function logout() {
     if (messageSubscription) {
-        supabase.removeChannel(messageSubscription);
+        supabaseClient.removeChannel(messageSubscription);
     }
-
+    
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
+    }
+ 
     // Send leave notification
     if (currentUser) {
         sendSystemMessage(`${currentUser} left the chat`);
     }
-
+ 
     currentUser = null;
     messagesInner.innerHTML = '';
     messageInput.value = '';
-
+    lastMessageId = 0;
+ 
     // Switch screens
     chatScreen.classList.remove('active');
     loginScreen.classList.add('active');
 }
-
+ 
 // ============================================
 // MESSAGES
 // ============================================
 async function loadMessages() {
     try {
-        const { data, error } = await supabase
+        const { data, error } = await supabaseClient
             .from('messages')
             .select('*')
             .order('created_at', { ascending: true })
             .limit(100);
-
+ 
         if (error) throw error;
-
+ 
         messagesInner.innerHTML = '';
-        data.forEach(msg => displayMessage(msg));
+        data.forEach(msg => {
+            displayMessage(msg);
+            if (msg.id > lastMessageId) {
+                lastMessageId = msg.id;
+            }
+        });
         scrollToBottom();
     } catch (error) {
         console.error('Error loading messages:', error);
+        alert('Failed to connect to database. Check your Supabase credentials.');
     }
 }
-
+ 
 function subscribeToMessages() {
-    messageSubscription = supabase
+    messageSubscription = supabaseClient
         .channel('messages')
         .on('postgres_changes', 
             { 
@@ -110,19 +132,57 @@ function subscribeToMessages() {
             }, 
             (payload) => {
                 displayMessage(payload.new);
+                if (payload.new.id > lastMessageId) {
+                    lastMessageId = payload.new.id;
+                }
                 scrollToBottom();
             }
         )
-        .subscribe();
+        .subscribe((status) => {
+            if (status === 'SUBSCRIBED') {
+                console.log('✓ Realtime connected');
+            } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                console.log('Realtime failed, switching to polling');
+                usePolling = true;
+                startPolling();
+            }
+        });
 }
-
+ 
+function startPolling() {
+    pollingInterval = setInterval(async () => {
+        try {
+            const { data, error } = await supabaseClient
+                .from('messages')
+                .select('*')
+                .gt('id', lastMessageId)
+                .order('created_at', { ascending: true });
+ 
+            if (error) throw error;
+ 
+            data.forEach(msg => {
+                displayMessage(msg);
+                if (msg.id > lastMessageId) {
+                    lastMessageId = msg.id;
+                }
+            });
+            
+            if (data.length > 0) {
+                scrollToBottom();
+            }
+        } catch (error) {
+            console.error('Polling error:', error);
+        }
+    }, 2000); // Poll every 2 seconds
+}
+ 
 async function sendMessage() {
     const text = messageInput.value.trim();
     
     if (!text || !currentUser) return;
-
+ 
     try {
-        const { error } = await supabase
+        const { error } = await supabaseClient
             .from('messages')
             .insert([
                 { 
@@ -131,20 +191,25 @@ async function sendMessage() {
                     message_type: 'user'
                 }
             ]);
-
+ 
         if (error) throw error;
-
+ 
         messageInput.value = '';
         updateCharCount();
+        
+        // If using polling, fetch immediately
+        if (usePolling) {
+            setTimeout(loadMessages, 500);
+        }
     } catch (error) {
         console.error('Error sending message:', error);
         alert('Failed to send message. Please try again.');
     }
 }
-
+ 
 async function sendSystemMessage(text) {
     try {
-        await supabase
+        await supabaseClient
             .from('messages')
             .insert([
                 { 
@@ -157,7 +222,7 @@ async function sendSystemMessage(text) {
         console.error('Error sending system message:', error);
     }
 }
-
+ 
 function displayMessage(msg) {
     const messageDiv = document.createElement('div');
     
@@ -169,12 +234,12 @@ function displayMessage(msg) {
         if (msg.username === currentUser) {
             messageDiv.classList.add('own');
         }
-
+ 
         const time = new Date(msg.created_at).toLocaleTimeString('en-US', {
             hour: '2-digit',
             minute: '2-digit'
         });
-
+ 
         messageDiv.innerHTML = `
             <div class="message-header">
                 <span class="message-username">${escapeHtml(msg.username)}</span>
@@ -183,64 +248,64 @@ function displayMessage(msg) {
             <div class="message-text">${escapeHtml(msg.message)}</div>
         `;
     }
-
+ 
     messagesInner.appendChild(messageDiv);
 }
-
+ 
 // ============================================
 // UTILITY FUNCTIONS
 // ============================================
 function scrollToBottom() {
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
-
+ 
 function updateCharCount() {
     const length = messageInput.value.length;
     charCount.textContent = `${length}/500`;
 }
-
+ 
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
 }
-
+ 
 // Update online count (simplified version)
 function updateOnlineCount() {
     // In a real app, you'd track active connections
     // For now, just show a random number between 1-10
     onlineCount.textContent = Math.floor(Math.random() * 10) + 1;
 }
-
+ 
 // ============================================
 // EVENT LISTENERS
 // ============================================
 joinBtn.addEventListener('click', joinChat);
-
+ 
 usernameInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') {
         joinChat();
     }
 });
-
+ 
 logoutBtn.addEventListener('click', logout);
-
+ 
 sendBtn.addEventListener('click', sendMessage);
-
+ 
 messageInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
     }
 });
-
+ 
 messageInput.addEventListener('input', updateCharCount);
-
+ 
 // ============================================
 // INITIALIZATION
 // ============================================
 updateOnlineCount();
 setInterval(updateOnlineCount, 30000); // Update every 30 seconds
-
+ 
 // Auto-focus username input on load
 usernameInput.focus();
